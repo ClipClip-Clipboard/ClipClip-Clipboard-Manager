@@ -1,0 +1,485 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include "app/applicationexceptionhandler.h"
+#include "common/log.h"
+#include "common/settings.h"
+
+#include "platform/dummy/dummyclipboard.h"
+#include "winplatform.h"
+#include "winplatformclipboard.h"
+#include "winplatformwindow.h"
+
+#include <QApplication>
+#include <QCoreApplication>
+#include <QDir>
+#include <QFileInfo>
+#include <QKeyEvent>
+#include <QMetaObject>
+#include <QMessageBox>
+#include <QSettings>
+#include <QStringList>
+#include <QWidget>
+
+#include <qt_windows.h>
+#include <shlobj.h>
+#include <objbase.h>
+#include <objidl.h>
+#include <shlguid.h>
+
+#include <dwmapi.h>
+#include <psapi.h>
+#include <stdio.h>
+#include <fcntl.h>
+#include <io.h>
+
+namespace {
+
+void setBinaryFor(int fd)
+{
+    _setmode(fd, _O_BINARY);
+}
+
+QString portableFolder()
+{
+    const QString appDir = QCoreApplication::applicationDirPath();
+    if ( !QFileInfo(appDir).isWritable() )
+        return {};
+
+    const QString uninstPath = appDir + QLatin1String("/unins000.exe");
+    if ( QFile::exists(uninstPath) )
+        return {};
+
+    QDir dir(appDir);
+    if ( !dir.mkpath(QStringLiteral("config"))
+      || !dir.mkpath(QStringLiteral("logs"))
+      || !dir.isReadable() )
+    {
+        return {};
+    }
+
+    const QString fullPath = dir.absolutePath();
+    if ( !QFileInfo(fullPath).isWritable() )
+        return {};
+
+    return fullPath;
+}
+
+QString getStartupFolderPath()
+{
+    wchar_t path[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_STARTUP, nullptr, 0, path))) {
+        return QString::fromWCharArray(path);
+    }
+    return {};
+}
+
+QString getAutostartShortcutPath()
+{
+    const QString startupFolder = getStartupFolderPath();
+    if (startupFolder.isEmpty())
+        return {};
+
+    return QStringLiteral("%1\\%2.lnk")
+           .arg(startupFolder, QCoreApplication::applicationName());
+}
+
+bool createShortcut(const QString &shortcutPath, const QString &targetPath, const QString &workingDir)
+{
+    HRESULT hres = CoInitialize(nullptr);
+    if (FAILED(hres) && hres != RPC_E_CHANGED_MODE)
+        return false;
+
+    IShellLinkW *pShellLink = nullptr;
+    hres = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                            IID_IShellLinkW, reinterpret_cast<void**>(&pShellLink));
+
+    bool success = false;
+    if (SUCCEEDED(hres)) {
+        pShellLink->SetPath(reinterpret_cast<const wchar_t*>(targetPath.utf16()));
+
+        // Set working directory to the application directory
+        pShellLink->SetWorkingDirectory(reinterpret_cast<const wchar_t*>(workingDir.utf16()));
+
+        IPersistFile *pPersistFile = nullptr;
+        hres = pShellLink->QueryInterface(IID_IPersistFile, reinterpret_cast<void**>(&pPersistFile));
+        if (SUCCEEDED(hres)) {
+            hres = pPersistFile->Save(reinterpret_cast<const wchar_t*>(shortcutPath.utf16()), TRUE);
+            success = SUCCEEDED(hres);
+            pPersistFile->Release();
+        }
+        pShellLink->Release();
+    }
+
+    CoUninitialize();
+    return success;
+}
+
+void uninstallControlHandler();
+
+BOOL appQuit()
+{
+    uninstallControlHandler();
+    const bool invoked = QMetaObject::invokeMethod(
+        QCoreApplication::instance(), "quit", Qt::BlockingQueuedConnection);
+    if (!invoked) {
+        log("Failed to request application exit", LogError);
+        return FALSE;
+    }
+    ExitProcess(EXIT_SUCCESS);
+    return TRUE;
+}
+
+BOOL ctrlHandler(DWORD fdwCtrlType)
+{
+    switch (fdwCtrlType) {
+    case CTRL_C_EVENT:
+        log("Terminating application on signal.");
+        return appQuit();
+
+    case CTRL_CLOSE_EVENT:
+        log("Terminating application on close event.");
+        return appQuit();
+
+    case CTRL_BREAK_EVENT:
+        log("Terminating application on break event.");
+        return appQuit();
+
+    case CTRL_LOGOFF_EVENT:
+        log("Terminating application on log off.");
+        return appQuit();
+
+    case CTRL_SHUTDOWN_EVENT:
+        log("Terminating application on shut down.");
+        return appQuit();
+
+    default:
+        return FALSE;
+    }
+}
+
+void installControlHandler()
+{
+    if ( !SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(ctrlHandler), TRUE) )
+        log("Failed to set Windows control handler.", LogError);
+}
+
+void uninstallControlHandler()
+{
+    SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(ctrlHandler), FALSE);
+}
+
+void initApplication(QCoreApplication *app)
+{
+    installControlHandler();
+    setBinaryFor(0);
+    setBinaryFor(1);
+
+    // Don't use Windows registry.
+    QSettings::setDefaultFormat(QSettings::IniFormat);
+
+    // Use config and log file in portable app folder.
+    const QString folder = portableFolder();
+    if ( !folder.isEmpty() ) {
+        const QString configFolder = folder + QLatin1String("/config");
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, configFolder);
+        if ( qEnvironmentVariableIsEmpty("COPYQ_LOG_DIR") )
+            qputenv("COPYQ_LOG_DIR", folder.toLocal8Bit() + "/logs");
+        app->setProperty("CopyQ_item_data_path", configFolder + QLatin1String("/items"));
+        app->setProperty("CopyQ_state_path", configFolder);
+    }
+}
+
+template <typename Application>
+Application *createApplication(int &argc, char **argv)
+{
+    Application *app = new ApplicationExceptionHandler<Application>(argc, argv);
+    initApplication(app);
+    return app;
+}
+
+QApplication *createGuiApplication(int &argc, char **argv)
+{
+    auto app = createApplication<QApplication>(argc, argv);
+
+    // WORKAROUND: Create a window so that application can receive
+    //             WM_QUERYENDSESSION (from installer) and similar events.
+    auto w = new QWidget();
+    auto winId = w->winId();
+    Q_UNUSED(winId)
+
+    return app;
+}
+
+QString windowClass(HWND window)
+{
+    WCHAR buf[32];
+    GetClassNameW(window, buf, 32);
+    return QString::fromUtf16(reinterpret_cast<ushort *>(buf));
+}
+
+HWND getLastVisibleActivePopUpOfWindow(HWND window)
+{
+    HWND currentWindow = window;
+
+    for (int i = 0; i < 50; ++i) {
+        HWND lastPopUp = GetLastActivePopup(currentWindow);
+
+        if (IsWindowVisible(lastPopUp))
+            return lastPopUp;
+
+        if (lastPopUp == currentWindow)
+            return nullptr;
+
+        currentWindow = lastPopUp;
+    }
+
+    return nullptr;
+}
+
+bool isWindowCloaked(HWND window)
+{
+    // Resolved at runtime to avoid linking dwmapi.
+    using DwmGetWindowAttributePtr = HRESULT (WINAPI *)(HWND, DWORD, PVOID, DWORD);
+    static const auto dwmGetWindowAttribute = []() -> DwmGetWindowAttributePtr {
+        const HMODULE dwmapi = LoadLibraryW(L"dwmapi.dll");
+        return dwmapi
+            ? reinterpret_cast<DwmGetWindowAttributePtr>(
+                  GetProcAddress(dwmapi, "DwmGetWindowAttribute") )
+            : nullptr;
+    }();
+
+    if (!dwmGetWindowAttribute)
+        return false;
+
+    DWORD cloaked = 0;
+    const HRESULT result =
+        dwmGetWindowAttribute(window, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+    return SUCCEEDED(result) && cloaked != 0;
+}
+
+bool hasWindowTitle(HWND window)
+{
+    WCHAR buf[2];
+    return GetWindowTextW(window, buf, 2) > 0;
+}
+
+bool isAltTabWindow(HWND window)
+{
+    if (!window || window == GetShellWindow())
+        return false;
+
+    if ( !IsWindowVisible(window) )
+        return false;
+
+    const LONG exStyle = GetWindowLong(window, GWL_EXSTYLE);
+    if (exStyle & WS_EX_TOOLWINDOW)
+        return false;
+
+    // Such a window never takes the keyboard focus, so pasting to it misses.
+    if (exStyle & WS_EX_NOACTIVATE)
+        return false;
+
+    HWND root = GetAncestor(window, GA_ROOTOWNER);
+
+    if (getLastVisibleActivePopUpOfWindow(root) != window)
+        return false;
+
+    // Suspended store applications and shell surfaces stay in the window list
+    // and report themselves as visible, but cannot be switched to.
+    if ( isWindowCloaked(window) )
+        return false;
+
+    if ( !hasWindowTitle(window) )
+        return false;
+
+    const QString cls = windowClass(window);
+    COPYQ_LOG_VERBOSE( QString("cls: \"%1\"").arg(cls) );
+    return !cls.isEmpty()
+            && cls != "Shell_TrayWnd"
+            && cls != "Shell_SecondaryTrayWnd"
+            && cls != "Shell_CharmWindow"
+            && cls != "DV2ControlHost"
+            && cls != "MsgrIMEWindowClass"
+            && cls != "SysShadow"
+            && cls != "Button"
+            && !cls.startsWith("WMP9MediaBarFlyout");
+}
+
+HWND currentWindow;
+BOOL CALLBACK getCurrentWindowProc(HWND window, LPARAM)
+{
+    if (!isAltTabWindow(window))
+        return TRUE;
+
+    currentWindow = window;
+    return FALSE;
+}
+
+} // namespace
+
+PlatformNativeInterface *platformNativeInterface()
+{
+    static WinPlatform platform;
+    return &platform;
+}
+
+PlatformWindowPtr WinPlatform::getWindow(WId winId)
+{
+    HWND window = reinterpret_cast<HWND>(winId);
+    return PlatformWindowPtr( window ? new WinPlatformWindow(window) : nullptr );
+}
+
+PlatformWindowPtr WinPlatform::getCurrentWindow()
+{
+    currentWindow = GetForegroundWindow();
+    if ( !isAltTabWindow(currentWindow) ) {
+        // The callback only assigns a window if it finds a suitable one, so
+        // reset first - returning the rejected window would be worse than
+        // returning nothing, and the caller keeps the last known window.
+        currentWindow = nullptr;
+        EnumWindows(getCurrentWindowProc, 0);
+        COPYQ_LOG( QStringLiteral("Current window: %1")
+                   .arg( currentWindow
+                         ? windowClass(currentWindow)
+                         : QStringLiteral("none") ) );
+    }
+    return PlatformWindowPtr( currentWindow ? new WinPlatformWindow(currentWindow) : nullptr );
+}
+
+bool WinPlatform::setPreventScreenCapture(WId winId, bool prevent)
+{
+    HWND window = reinterpret_cast<HWND>(winId);
+    if (!window)
+        return false;
+
+    // Remote desktop clients are screen capture systems — applying
+    // WDA_EXCLUDEFROMCAPTURE makes windows invisible to the remote viewer.
+    if (prevent && GetSystemMetrics(SM_REMOTESESSION)) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            log("Skipping screen capture prevention in remote desktop session", LogWarning);
+
+            const QLatin1String optionKey("Options/screen_capture_warning_acknowledged");
+            Settings settings;
+            if (!settings.value(optionKey, false).toBool()) {
+                QMessageBox::warning(
+                    nullptr,
+                    QObject::tr("Screen Capture Prevention Unavailable"),
+                    QObject::tr(
+                        "The option to hide from screenshots is enabled but cannot"
+                        " take effect in a remote desktop session. Window content"
+                        " may be visible to screen capture."));
+                settings.setValue(optionKey, true);
+            }
+        }
+
+        SetWindowDisplayAffinity(window, WDA_NONE);
+        return false;
+    }
+
+    return SetWindowDisplayAffinity(
+        window, prevent ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE);
+}
+
+QCoreApplication *WinPlatform::createConsoleApplication(int &argc, char **argv)
+{
+    return createApplication<QCoreApplication>(argc, argv);
+}
+
+QApplication *WinPlatform::createServerApplication(int &argc, char **argv)
+{
+    return createGuiApplication(argc, argv);
+}
+
+QGuiApplication *WinPlatform::createClipboardProviderApplication(int &argc, char **argv)
+{
+    return createApplication<QGuiApplication>(argc, argv);
+}
+
+QCoreApplication *WinPlatform::createClientApplication(int &argc, char **argv)
+{
+    return createApplication<QCoreApplication>(argc, argv);
+}
+
+QGuiApplication *WinPlatform::createTestApplication(int &argc, char **argv)
+{
+    return createApplication<QGuiApplication>(argc, argv);
+}
+
+PlatformClipboardPtr WinPlatform::clipboard()
+{
+    return PlatformClipboardPtr(new WinPlatformClipboard());
+}
+
+QStringList WinPlatform::getCommandLineArguments(int, char**)
+{
+    int argumentCount;
+    LPWSTR *arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount);
+
+    QStringList result;
+
+    for (int i = 1; i < argumentCount; ++i)
+        result.append( QString::fromUtf16(reinterpret_cast<ushort*>(arguments[i])) );
+
+    return result;
+}
+
+bool WinPlatform::findPluginDir(QDir *pluginsDir)
+{
+    pluginsDir->setPath( qApp->applicationDirPath() );
+    return pluginsDir->cd("plugins");
+}
+
+QString WinPlatform::defaultEditorCommand()
+{
+    return "notepad %1";
+}
+
+QString WinPlatform::translationPrefix()
+{
+    return QCoreApplication::applicationDirPath() + "/translations";
+}
+
+QString WinPlatform::themePrefix()
+{
+    return QApplication::applicationDirPath() + "/themes";
+}
+
+bool WinPlatform::isAutostartEnabled()
+{
+    const QString shortcutPath = getAutostartShortcutPath();
+    return !shortcutPath.isEmpty() && QFile::exists(shortcutPath);
+}
+
+void WinPlatform::setAutostartEnabled(bool enable)
+{
+    const QString shortcutPath = getAutostartShortcutPath();
+    if (shortcutPath.isEmpty()) {
+        log("Failed to get autostart shortcut path", LogError);
+        return;
+    }
+
+    if (enable) {
+        const QString exePath = QDir::toNativeSeparators(QCoreApplication::applicationFilePath());
+        const QString dirPath = QDir::toNativeSeparators(QCoreApplication::applicationDirPath());
+        if (!createShortcut(shortcutPath, exePath, dirPath)) {
+            log(QStringLiteral("Failed to create autostart shortcut at \"%1\"").arg(shortcutPath), LogError);
+        }
+    } else if (QFile::exists(shortcutPath) && !QFile::remove(shortcutPath)) {
+        log(QStringLiteral("Failed to remove autostart shortcut at \"%1\"").arg(shortcutPath), LogError);
+    }
+}
+
+qint64 WinPlatform::processResidentMemoryBytes(qint64 pid)
+{
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, static_cast<DWORD>(pid));
+    if (!hProcess)
+        return -1;
+    PROCESS_MEMORY_COUNTERS pmc;
+    qint64 result = -1;
+    if (GetProcessMemoryInfo(hProcess, &pmc, sizeof(pmc)))
+        result = static_cast<qint64>(pmc.WorkingSetSize);
+    CloseHandle(hProcess);
+    return result;
+}

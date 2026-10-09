@@ -1,0 +1,215 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include "test_utils.h"
+#include "tests.h"
+#include "tests_common.h"
+
+#include "common/commandstatus.h"
+#include "common/config.h"
+#include "common/log.h"
+#include "common/version.h"
+#include "common/settings.h"
+
+#include <QRegularExpression>
+
+void CoreTests::configPath()
+{
+    RUN("print(info('config'))", Settings().fileName());
+}
+
+void CoreTests::readLog()
+{
+    QByteArray stdoutActual;
+    QByteArray stderrActual;
+    QCOMPARE( run(Args("info") << "log", &stdoutActual, &stderrActual), 0 );
+    QVERIFY2( testStderr(stderrActual), stderrActual );
+
+    QCOMPARE(stdoutActual, qEnvironmentVariable("COPYQ_LOG_FILE") + "\n");
+
+    const QString logFile = logFileName();
+    QCOMPARE(stdoutActual, logFile + "\n");
+
+    const QByteArray log = readLogFile(maxReadLogSize);
+    QVERIFY2(!log.isEmpty(), logFile.toUtf8());
+
+    const QStringList lines = splitLines(readLogFile(maxReadLogSize));
+
+    const auto configPattern = QStringLiteral(
+        R"(^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\] DEBUG <Server-\d+>: Loading configuration$)");
+    QVERIFY2(count(lines, configPattern), log);
+
+    const auto monitorPattern = QStringLiteral(
+        R"(^\[.*\] DEBUG <Server-\d+>: Starting monitor$)");
+    QVERIFY2(count(lines, monitorPattern), log);
+
+    {
+        QTemporaryDir tmpDir;
+        QVERIFY(tmpDir.isValid());
+        m_test->setEnv("COPYQ_LOG_FILE", "");
+        m_test->setEnv("COPYQ_LOG_DIR", tmpDir.path());
+        QCOMPARE( run(Args("info") << "log", &stdoutActual, &stderrActual), 0 );
+        QVERIFY2( testStderr(stderrActual), stderrActual );
+        const auto actualPattern = QString::fromUtf8(stdoutActual)
+            .replace(QRegularExpression(R"(-\d*-\d*\.log\n$)"), "*");
+        const QString expectedPattern = QStringLiteral("%1/copyq*").arg(tmpDir.path());
+        QCOMPARE( actualPattern, expectedPattern );
+    }
+
+    {
+        m_test->setEnv("COPYQ_LOG_FILE", "");
+        m_test->setEnv("COPYQ_LOG_DIR", "");
+        QCOMPARE( run(Args("info") << "log", &stdoutActual, &stderrActual), 0 );
+        QVERIFY2( testStderr(stderrActual), stderrActual );
+        const auto actualPattern = QString::fromUtf8(stdoutActual)
+            .replace(QRegularExpression(R"(-\d*-\d*\.log\n$)"), "*");
+        const QString expectedPattern = QStringLiteral("%1/copyq*")
+            .arg(getDefaultLogFilePath());
+        QCOMPARE( actualPattern, expectedPattern );
+    }
+}
+
+void CoreTests::rotateLog()
+{
+    QByteArray stdoutActual;
+    QByteArray stderrActual;
+    QCOMPARE( run(Args("info") << "log", &stdoutActual, &stderrActual), 0 );
+    QVERIFY2( testStderr(stderrActual), stderrActual );
+    const auto logDirPath = QString::fromUtf8(stdoutActual).section("/", 0, -2);
+    QVERIFY( !logDirPath.isEmpty() );
+
+    const QByteArray logData(logFileSize, '-');
+    const QDir logDir(logDirPath);
+    QVERIFY2( logDir.exists(), logDirPath.toUtf8() );
+    const auto listLogFiles = [&](const int rotateNumber = -1) {
+        const QString pattern = rotateNumber == -1
+            ? QStringLiteral("tests*.log.*")
+            : QStringLiteral("tests*.log.%1").arg(rotateNumber);
+        return logDir.entryList({pattern}, QDir::Files, QDir::Name);
+    };
+    const auto logFilesMessage = [&](int i) {
+        return QStringLiteral("%2 (rotateCount = %1):\n  %3").arg(i).arg(
+            logDirPath.toUtf8(),
+            listLogFiles().join("\n  ")).toUtf8();
+    };
+
+    for (int i = 1; i < logFileCount; ++i) {
+        QCOMPARE( run(Args("serverLog") << "-", &stdoutActual, &stderrActual, logData), 0 );
+        QVERIFY2( testStderr(stderrActual), stderrActual );
+        QVERIFY2( listLogFiles().count() >= i, logFilesMessage(i) );
+        QVERIFY2( !listLogFiles(i).isEmpty(), logFilesMessage(i) );
+    }
+    QCOMPARE( run(Args("serverLog") << "-", &stdoutActual, &stderrActual, logData), 0 );
+    QVERIFY2( testStderr(stderrActual), stderrActual );
+    const auto logFiles = listLogFiles(logFileCount);
+    QVERIFY2( logFiles.isEmpty(), logFilesMessage(logFileCount) );
+}
+
+void CoreTests::pluginsDisabled()
+{
+    // Ensure that plugins that could interfere with tests are disabled
+    RUN_EXPECT_ERROR("plugins.itemsync", CommandException);
+    RUN_EXPECT_ERROR("plugins.itemencrypted", CommandException);
+    RUN_EXPECT_ERROR("plugins.itempinned", CommandException);
+
+    const QByteArray log = readLogFile(maxReadLogSize);
+    QVERIFY2( !log.contains("itemencrypted"), log );
+    QVERIFY2( !log.contains("[copyq.plugin"), log );
+}
+
+void CoreTests::commandHelp()
+{
+    QByteArray stdoutActual;
+    QByteArray stderrActual;
+    QCOMPARE( run(Args("help"), &stdoutActual, &stderrActual), 0 );
+    QVERIFY2( testStderr(stderrActual), stderrActual );
+    QVERIFY(!stdoutActual.isEmpty());
+
+    const auto commands = QStringList()
+            << "show"
+            << "hide"
+            << "toggle"
+            << "menu"
+            << "exit"
+            << "help"
+            << "version"
+            << "clipboard"
+            << "copy"
+            << "paste"
+            << "action"
+            << "add"
+            << "remove";
+
+    for (const auto &command : commands) {
+        QCOMPARE( run(Args("help") << command, &stdoutActual, &stderrActual), 0 );
+        QVERIFY2( testStderr(stderrActual), stderrActual );
+        QVERIFY( !stdoutActual.isEmpty() );
+        const auto help = QString::fromUtf8(stdoutActual);
+        QVERIFY( help.contains(QRegularExpression("\\b" + QRegularExpression::escape(command) + "\\b")) );
+    }
+
+    // Print error on unknown function name.
+    m_test->ignoreErrors(QRegularExpression("Error: Command not found!"));
+    RUN_EXPECT_ERROR("help" << "xxx", CommandException);
+}
+
+void CoreTests::commandVersion()
+{
+    QByteArray stdoutActual;
+    QByteArray stderrActual;
+    QCOMPARE( run(Args("version"), &stdoutActual, &stderrActual), 0 );
+    QVERIFY2( testStderr(stderrActual), stderrActual );
+    QVERIFY( !stdoutActual.isEmpty() );
+
+    const auto version = QString::fromUtf8(stdoutActual);
+    // Version contains application name and version.
+    QVERIFY( version.contains(QRegularExpression("\\bCopyQ\\b.*" + QRegularExpression::escape(versionString))) );
+    // Version contains Qt version.
+    QVERIFY( version.contains(QRegularExpression("\\bQt:\\s+\\d")) );
+
+    // Version string format: Major.Minor.Patch[.N-gSHA]
+    //   14.0.0                (tagged release)
+    //   14.0.0.4-g1175475d    (4 commits after tag)
+    const QRegularExpression re(
+        "^\\d+\\.\\d+\\.\\d+"     // Major.Minor.Patch
+        "(\\.\\d+-g[0-9a-f]+)?$"  // optional .commits-gSHA suffix
+    );
+    QVERIFY2(
+        re.match(versionString).hasMatch(),
+        qPrintable(QStringLiteral("versionString '%1' does not match expected format").arg(versionString))
+    );
+}
+
+void CoreTests::badCommand()
+{
+    RUN_EXPECT_ERROR_WITH_STDERR("xxx", CommandException, "xxx");
+    RUN_EXPECT_ERROR_WITH_STDERR("tab" << testTab(1) << "yyy", CommandException, "yyy");
+
+    // Bad command shouldn't create new tab.
+    QByteArray stdoutActual;
+    QByteArray stderrActual;
+    QCOMPARE( run(Args("tab"), &stdoutActual, &stderrActual), 0 );
+    QVERIFY2( testStderr(stderrActual), stderrActual );
+    QVERIFY( !QString::fromUtf8(stdoutActual)
+             .contains(QRegularExpression("^" + QRegularExpression::escape(testTab(1)) + "$")) );
+}
+
+void CoreTests::badSessionName()
+{
+    m_test->ignoreErrors(QRegularExpression(
+        "ERROR: Session name must contain at most 16 characters"
+        "|ERROR.*which can be letters, digits"
+    ));
+    RUN_EXPECT_ERROR("-s" << "max_16_characters_in_session_name_allowed" << "", CommandBadSyntax);
+    RUN_EXPECT_ERROR("-s" << "spaces disallowed" << "", CommandBadSyntax);
+}
+
+void CoreTests::commandSession()
+{
+    RUN("--session" << sessionName << "eval" << "print(1)", "1");
+}
+
+void CoreTests::commandCatchExceptions()
+{
+    RUN("try { removeTab('MISSING') } catch(e) { print(e) }",
+        "Error: Tab with given name doesn't exist!");
+}
